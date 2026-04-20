@@ -24,11 +24,21 @@ object AuthHelper {
     fun hasWriteSecureSettingsPermission(context: Context): Boolean {
         return try {
             val cr = context.contentResolver
-            val originalValue = Settings.Secure.getInt(cr, "reduce_bright_colors_activated", 0)
-            Settings.Secure.putInt(cr, "reduce_bright_colors_activated", originalValue)
+            val key = "reduce_bright_colors_activated"
+            
+            var currentValue = 0
+            try {
+                currentValue = Settings.Secure.getInt(cr, key, 0)
+            } catch (e: Exception) {
+            }
+            
+            Settings.Secure.putInt(cr, key, currentValue)
             true
+        } catch (e: SecurityException) {
+            Log.w(TAG, "WRITE_SECURE_SETTINGS permission denied: ${e.message}")
+            false
         } catch (e: Exception) {
-            Log.v(TAG, "WRITE_SECURE_SETTINGS permission check failed: ${e.message}")
+            Log.w(TAG, "WRITE_SECURE_SETTINGS permission check failed: ${e.javaClass.simpleName} - ${e.message}")
             false
         }
     }
@@ -102,8 +112,18 @@ object AuthHelper {
             val permission = "android.permission.WRITE_SECURE_SETTINGS"
             val command = "pm grant $packageName $permission"
             
-            val process = Shizuku::class.java.getMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
-                .invoke(null, arrayOf("sh", "-c", command), null, null) as ShizukuRemoteProcess
+            val newProcessMethod = Shizuku::class.java.getMethod(
+                "newProcess", 
+                Array<String>::class.java, 
+                Array<String>::class.java, 
+                String::class.java
+            )
+            val process = newProcessMethod.invoke(
+                null, 
+                arrayOf("sh", "-c", command), 
+                null, 
+                null
+            ) as ShizukuRemoteProcess
 
             val exitCode = process.waitFor()
             

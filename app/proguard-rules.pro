@@ -19,6 +19,6 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
--keep class top.wkbin.verydark.MainActivityKt { *; }
+-keep class top.wkbin.verydark.MainActivity { *; }
 -keep class top.wkbin.verydark.IUserService { *; }
 -keep class top.wkbin.verydark.UserService { *; }

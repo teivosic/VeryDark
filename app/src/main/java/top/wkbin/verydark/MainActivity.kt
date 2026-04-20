@@ -8,6 +8,7 @@ import android.content.pm.PackageManager.PERMISSION_GRANTED
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -216,17 +217,17 @@ class MainActivity : ComponentActivity(), Shizuku.OnBinderReceivedListener,
                         0
                     ) == 1
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.w("MainActivity", "Failed to read reduce_bright_colors_activated", e)
                     false
                 }
                 currentLight = try {
-                    Settings.Secure.getInt(
+                    100 - Settings.Secure.getInt(
                         context.contentResolver,
                         "reduce_bright_colors_level",
                         100
                     )
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.w("MainActivity", "Failed to read reduce_bright_colors_level", e)
                     0
                 }
             }
