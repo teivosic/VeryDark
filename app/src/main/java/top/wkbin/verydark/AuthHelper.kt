@@ -6,10 +6,11 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.provider.Settings
 import android.util.Log
 import rikka.shizuku.Shizuku
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.ShizukuRemoteProcess
 import java.io.DataOutputStream
@@ -17,29 +18,81 @@ import androidx.core.net.toUri
 
 object AuthHelper {
     private const val TAG = "AuthHelper"
-    
+
     /**
      * 检查是否有 WRITE_SECURE_SETTINGS 权限
+     *
+     * 只读探测：直接 checkSelfPermission，避免旧实现"先读再写回原值"带来的副作用
+     * （旧实现在磁贴 onStartListening 等场景被反复调用时会触发无谓的 putInt 写入）。
      */
     fun hasWriteSecureSettingsPermission(context: Context): Boolean {
         return try {
-            val cr = context.contentResolver
-            val key = "reduce_bright_colors_activated"
-            
-            var currentValue = 0
-            try {
-                currentValue = Settings.Secure.getInt(cr, key, 0)
-            } catch (e: Exception) {
-            }
-            
-            Settings.Secure.putInt(cr, key, currentValue)
-            true
-        } catch (e: SecurityException) {
-            Log.w(TAG, "WRITE_SECURE_SETTINGS permission denied: ${e.message}")
-            false
+            context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                PackageManager.PERMISSION_GRANTED
         } catch (e: Exception) {
             Log.w(TAG, "WRITE_SECURE_SETTINGS permission check failed: ${e.javaClass.simpleName} - ${e.message}")
             false
+        }
+    }
+
+    /**
+     * 通过 Shizuku 以 shell（uid 2000）身份执行一条命令，返回退出码与 stdout。
+     *
+     * shell 用户天然可写 Settings.Secure，因此即便 APP 自身未持有
+     * WRITE_SECURE_SETTINGS，只要 Shizuku 已授权，就能用 `settings put` 写入。
+     * 失败/不可用时返回 [ShellResult.failed]。
+     */
+    suspend fun execShellViaShizuku(command: String): ShellResult = withContext(Dispatchers.IO) {
+        try {
+            if (!isShizukuAuthorized()) {
+                Log.w(TAG, "Shizuku 未授权，无法执行命令")
+                return@withContext ShellResult.failed()
+            }
+            val newProcessMethod = Shizuku::class.java.getMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            val process = newProcessMethod.invoke(
+                null,
+                arrayOf("sh", "-c", command),
+                null,
+                null
+            ) as ShizukuRemoteProcess
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val exitCode = process.waitFor()
+            ShellResult(exitCode, output)
+        } catch (e: Exception) {
+            Log.e(TAG, "通过 Shizuku 执行命令失败: $command", e)
+            ShellResult.failed()
+        }
+    }
+
+    /**
+     * 通过 Root（su）执行一条命令，返回退出码与 stdout。不可用时返回 [ShellResult.failed]。
+     */
+    suspend fun execShellViaRoot(command: String): ShellResult = withContext(Dispatchers.IO) {
+        try {
+            val process = Runtime.getRuntime().exec("su")
+            val outputStream = DataOutputStream(process.outputStream)
+            outputStream.writeBytes("$command\n")
+            outputStream.writeBytes("exit\n")
+            outputStream.flush()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val exitCode = process.waitFor()
+            ShellResult(exitCode, output)
+        } catch (e: Exception) {
+            Log.e(TAG, "通过 Root 执行命令失败: $command", e)
+            ShellResult.failed()
+        }
+    }
+
+    /** shell 命令执行结果：退出码 + stdout。exitCode < 0 表示未能执行。 */
+    data class ShellResult(val exitCode: Int, val output: String) {
+        val ok: Boolean get() = exitCode == 0
+        companion object {
+            fun failed() = ShellResult(-1, "")
         }
     }
     
@@ -81,7 +134,9 @@ object AuthHelper {
             
             if (isShizukuAuthorized()) {
                 // 已经授权，直接尝试授予 WRITE_SECURE_SETTINGS
-                grantWriteSecureSettingsViaShizuku(context)
+                CoroutineScope(Dispatchers.IO).launch {
+                    grantWriteSecureSettingsViaShizuku(context)
+                }
             } else {
                 // 请求 Shizuku 权限
                 Shizuku.requestPermission(requestCode)
@@ -93,48 +148,32 @@ object AuthHelper {
     
     /**
      * 通过 Shizuku 授予 WRITE_SECURE_SETTINGS 权限
-     * 
+     *
      * 注意：WRITE_SECURE_SETTINGS 是一个特殊权限，需要通过 shell 命令 "pm grant" 来授予
      */
-    fun grantWriteSecureSettingsViaShizuku(context: Context): Boolean {
-        return try {
+    suspend fun grantWriteSecureSettingsViaShizuku(context: Context): Boolean = withContext(Dispatchers.IO) {
+        try {
             if (hasWriteSecureSettingsPermission(context)) {
                 Log.d(TAG, "已有 WRITE_SECURE_SETTINGS 权限，无需重复授权")
-                return true
+                return@withContext true
             }
-            
+
             if (!isShizukuAuthorized()) {
                 Log.e(TAG, "Shizuku 未授权，无法执行命令")
-                return false
+                return@withContext false
             }
-            
-            val packageName = context.packageName
-            val permission = "android.permission.WRITE_SECURE_SETTINGS"
-            val command = "pm grant $packageName $permission"
-            
-            val newProcessMethod = Shizuku::class.java.getMethod(
-                "newProcess", 
-                Array<String>::class.java, 
-                Array<String>::class.java, 
-                String::class.java
-            )
-            val process = newProcessMethod.invoke(
-                null, 
-                arrayOf("sh", "-c", command), 
-                null, 
-                null
-            ) as ShizukuRemoteProcess
 
-            val exitCode = process.waitFor()
-            
+            val command = "pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS"
+            val exitCode = execShellViaShizuku(command).exitCode
+
             if (exitCode == 0) {
                 Thread.sleep(500)
                 if (hasWriteSecureSettingsPermission(context)) {
                     Log.d(TAG, "通过 Shizuku 成功授予 WRITE_SECURE_SETTINGS 权限")
-                    return true
+                    return@withContext true
                 }
             }
-            
+
             Log.w(TAG, "Shizuku 命令执行结束，但权限验证失败或退出码不为0: $exitCode")
             false
         } catch (e: Exception) {
@@ -169,27 +208,19 @@ object AuthHelper {
                 Log.d(TAG, "已有 WRITE_SECURE_SETTINGS 权限，无需重复授权")
                 return@withContext true
             }
-            
-            val packageName = context.packageName
-            val command = "pm grant $packageName android.permission.WRITE_SECURE_SETTINGS"
-            
-            val process = Runtime.getRuntime().exec("su")
-            val outputStream = DataOutputStream(process.outputStream)
-            outputStream.writeBytes("$command\n")
-            outputStream.writeBytes("exit\n")
-            outputStream.flush()
-            
-            val exitValue = process.waitFor()
-            
-            if (exitValue == 0) {
+
+            val command = "pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS"
+            val exitCode = execShellViaRoot(command).exitCode
+
+            if (exitCode == 0) {
                 Thread.sleep(500)
                 if (hasWriteSecureSettingsPermission(context)) {
                     Log.d(TAG, "通过 Root 成功授予 WRITE_SECURE_SETTINGS 权限")
                     return@withContext true
                 }
             }
-            
-            Log.w(TAG, "Root 命令执行结束，但权限验证失败或退出码不为0: $exitValue")
+
+            Log.w(TAG, "Root 命令执行结束，但权限验证失败或退出码不为0: $exitCode")
             false
         } catch (e: Exception) {
             Log.e(TAG, "通过 Root 授予权限失败", e)
